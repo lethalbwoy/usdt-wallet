@@ -17,13 +17,13 @@ TELEGRAM_BOT_TOKEN=optional
 TELEGRAM_CHAT_ID=optional
 THRESHOLD_USD=200
 GAS_RESERVE_GWEI=10
-POLL_INTERVAL_MS=5000
+POLL_INTERVAL_MS=500      # smaller interval is okay when WS is active; this is fallback
 APPROVE_REVOKE_LIST=0x...,0x...
 KEEP_ETH_AFTER_USDT=0.001
 PORT=3000
 */
 
-const RPC_URLS = (process.env.RPC_URLS || "").split(",").map(s => s.trim()).filter(Boolean);
+const RPC_URLS = (process.env.RPC_URLS || "").split(",").map((s) => s.trim()).filter(Boolean);
 if (RPC_URLS.length === 0) {
   console.error("Please set RPC_URLS in .env");
   process.exit(1);
@@ -44,19 +44,22 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const THRESHOLD_USD = Number(process.env.THRESHOLD_USD || "200");
 const GAS_RESERVE_GWEI = Number(process.env.GAS_RESERVE_GWEI || "10");
-const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || "5000");
+const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || "500");
 const KEEP_ETH_AFTER_USDT = Number(process.env.KEEP_ETH_AFTER_USDT || "0"); // ETH to leave behind
 const DESTINATION = process.env.DESTINATION;
 const USDT_CONTRACT = process.env.USDT_CONTRACT || "0xdAC17F958D2ee523a2206206994597C13D831ec7";
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
 const APPROVE_REVOKE_LIST = (process.env.APPROVE_REVOKE_LIST || "")
-  .split(",").map(s => s.trim()).filter(Boolean);
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 if (!PRIVATE_KEY || !DESTINATION) {
   console.error("Please set PRIVATE_KEY and DESTINATION in .env");
   process.exit(1);
 }
 
+// create provider + wallet
 provider = getProvider();
 const wallet = new ethers.Wallet(PRIVATE_KEY.startsWith("0x") ? PRIVATE_KEY : `0x${PRIVATE_KEY}`, provider);
 console.log("Watching:", wallet.address);
@@ -80,10 +83,20 @@ const walletAddr = wallet.address.toLowerCase();
 const USDT = USDT_CONTRACT;
 const TRANSFER_TOPIC = ethers.id("Transfer(address,address,uint256)");
 
+// --- Create USDT contract with signer (wallet) ---
+const ERC20_ABI = [
+  "function balanceOf(address) view returns (uint256)",
+  "function decimals() view returns (uint8)",
+  "function transfer(address to, uint256 amount) returns (bool)",
+  "function approve(address spender, uint256 amount) returns (bool)",
+];
+const usdtContract = new ethers.Contract(USDT_CONTRACT, ERC20_ABI, wallet);
+
 if (wsProvider) {
   const filter = {
     address: USDT,
-    topics: [TRANSFER_TOPIC, null, zeroPadValue(walletAddr, 32)],  };
+    topics: [TRANSFER_TOPIC, null, zeroPadValue(walletAddr, 32)],
+  };
 
   wsProvider.on(filter, async (log) => {
     try {
@@ -144,22 +157,11 @@ async function retry(fn, attempts = 3, delay = 1200) {
       if (msg.includes("429") || msg.includes("rate limit") || msg.includes("timeout") || msg.includes("503")) {
         rotateRpc();
       }
-      if (i < attempts - 1) await new Promise(r => setTimeout(r, delay * (i + 1)));
+      if (i < attempts - 1) await new Promise((r) => setTimeout(r, delay * (i + 1)));
     }
   }
   throw lastErr;
 }
-
-// --- ERC20 minimal ABI ---
-const ERC20_ABI = [
-  "function balanceOf(address) view returns (uint256)",
-  "function decimals() view returns (uint8)",
-  "function transfer(address to, uint256 amount) returns (bool)",
-  "function approve(address spender, uint256 amount) returns (bool)"
-];
-
-// Create USDT contract instance with wallet as signer (so methods will send txs)
-const usdtContract = new ethers.Contract(USDT_CONTRACT, ERC20_ABI, wallet);
 
 // --- Price helper (CoinGecko) ---
 async function getEthPriceUsd() {
@@ -175,10 +177,10 @@ async function getEthPriceUsd() {
 
 // --- Utility: get human balances ---
 async function getEthBalance() {
-  return await retry(() => provider.getBalance(wallet.address)); // returns bigint
+  return await retry(() => provider.getBalance(wallet.address)); // bigint
 }
 async function getERC20Balance(contract) {
-  return await retry(() => contract.balanceOf(wallet.address)); // returns bigint
+  return await retry(() => contract.balanceOf(wallet.address)); // bigint
 }
 async function getERC20Decimals(contract) {
   try {
@@ -249,7 +251,10 @@ async function sweepETH() {
     const ethBalance = Number(ethers.formatEther(balance));
     console.log("ETH balance:", ethBalance, "ETH");
 
-    const gasPrice = await provider.getGasPrice(); // bigint
+    // Use getFeeData instead of getGasPrice()
+    const feeDataForGas = await provider.getFeeData(); // has gasPrice or maxFeePerGas fields
+    const gasPrice = feeDataForGas.gasPrice || feeDataForGas.maxFeePerGas || ethers.parseUnits("5", "gwei");
+
     const gasLimitEstimate = 21000n;
     const gasReserveWei = ethers.parseUnits(String(GAS_RESERVE_GWEI), "gwei") * gasLimitEstimate;
 
@@ -278,6 +283,8 @@ async function sweepETH() {
       tx.maxPriorityFeePerGas = feeData.maxPriorityFeePerGas;
     } else if (feeData.gasPrice) {
       tx.gasPrice = feeData.gasPrice;
+    } else {
+      tx.gasPrice = gasPrice;
     }
 
     const signedTx = await wallet.sendTransaction(tx);
@@ -298,11 +305,26 @@ async function emergencyHandle(triggerInfo) {
     await sendTelegram(`🚨 Trigger: ${triggerInfo}. Starting revoke & sweep sequence.`);
     console.log("Starting revoke & sweep...");
     await revokeApprovals();
-    await new Promise(r => setTimeout(r, 500));
-    const usdtTx = await sweepUSDT();
-    await new Promise(r => setTimeout(r, 1000));
+    await new Promise((r) => setTimeout(r, 500));
+    // Check ETH required for token transfer before attempting USDT sweep
+    const feeData = await provider.getFeeData();
+    const gasPriceForToken = feeData.gasPrice || feeData.maxFeePerGas || ethers.parseUnits("5", "gwei");
+    const gasLimitForToken = 100000n; // conservative
+    const neededForTokenWei = gasPriceForToken * gasLimitForToken;
+
+    const ethBalNow = await getEthBalance();
+    if (ethBalNow < neededForTokenWei) {
+      await sendTelegram(
+        `⚠️ Incoming funds but not enough ETH for USDT gas. Need approx ${ethers.formatEther(neededForTokenWei)} ETH to cover transfer gas. Skipping USDT sweep.`
+      );
+    } else {
+      const usdtTx = await sweepUSDT();
+      // small pause to ensure token events processed
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+
     const ethTx = await sweepETH();
-    await sendTelegram(`✅ Emergency sweep complete. USDT tx: ${usdtTx || "none"}, ETH tx: ${ethTx || "none"}`);
+    await sendTelegram(`✅ Emergency sweep complete. ETH tx: ${ethTx || "none"}`);
   } catch (err) {
     console.error("Emergency handler failed:", err?.message || err);
     await sendTelegram(`❌ Emergency handler error: ${err?.message || err}`);
@@ -367,11 +389,12 @@ async function pollLoop() {
       }
 
       // auto-sweep if ETH exists and can pay gas
-      const gasPrice = await provider.getGasPrice();
+      const feeData = await provider.getFeeData();
+      const gasPriceNow = feeData.gasPrice || feeData.maxFeePerGas || ethers.parseUnits("5", "gwei");
       const gasLimitForToken = 100000n;
-      const neededForTokenWei = gasPrice * gasLimitForToken;
+      const neededForTokenWei = gasPriceNow * gasLimitForToken;
       const gasReserveWei = ethers.parseUnits(String(GAS_RESERVE_GWEI), "gwei") * 21000n;
-      if (lastEthBalance >= (neededForTokenWei + gasReserveWei)) {
+      if (lastEthBalance >= neededForTokenWei + gasReserveWei) {
         if (lastUsdtBalance !== 0n) {
           console.log("ETH available for gas & USDT exists -> attempting sweep sequence");
           await emergencyHandle("ETH present and USDT present");
@@ -384,7 +407,7 @@ async function pollLoop() {
       if (msg.includes("rate") || msg.includes("timeout") || msg.includes("503")) rotateRpc();
     }
 
-    await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
   }
 }
 
