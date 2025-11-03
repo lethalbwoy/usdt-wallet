@@ -4,7 +4,7 @@ dotenv.config();
 
 import fetch from "node-fetch";
 import express from "express";
-import { ethers } from "ethers";
+import { ethers, zeroPadValue } from "ethers";
 
 /*
 ENV vars required:
@@ -83,8 +83,7 @@ const TRANSFER_TOPIC = ethers.id("Transfer(address,address,uint256)");
 if (wsProvider) {
   const filter = {
     address: USDT,
-    topics: [TRANSFER_TOPIC, null, ethers.hexZeroPad(walletAddr, 32)],
-  };
+    topics: [TRANSFER_TOPIC, null, zeroPadValue(walletAddr, 32)],  };
 
   wsProvider.on(filter, async (log) => {
     try {
@@ -417,4 +416,3 @@ process.on("unhandledRejection", (reason) => {
     process.exit(1);
   }
 })();
-
