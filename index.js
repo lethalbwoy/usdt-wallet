@@ -4,7 +4,7 @@ dotenv.config();
 
 import fetch from "node-fetch";
 import express from "express";
-import ethers from "ethers";
+import { ethers } from "ethers";
 
 /*
 ENV vars required:
@@ -417,3 +417,4 @@ process.on("unhandledRejection", (reason) => {
     process.exit(1);
   }
 })();
+
